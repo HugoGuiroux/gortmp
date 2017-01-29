@@ -168,31 +168,27 @@ func HandshakeSample(c net.Conn, br *bufio.Reader, bw *bufio.Writer, timeout tim
 	return
 }
 
-func Handshake(c net.Conn, br *bufio.Reader, bw *bufio.Writer, timeout time.Duration) (err error) {
+func Handshake(c net.Conn, br *bufio.Reader, bw *bufio.Writer, timeout time.Duration, encrypt bool) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = r.(error)
 		}
 	}()
-	// Send C0+C1
+	// Send C0
 	err = bw.WriteByte(0x03)
 	CheckError(err, "Handshake() Send C0")
+
+	// Send C1
 	c1 := CreateRandomBlock(RTMP_SIG_SIZE)
-	// Set Timestamp
-	// binary.BigEndian.PutUint32(c1, uint32(GetTimestamp()))
-	binary.BigEndian.PutUint32(c1, uint32(0))
-	// Set FlashPlayer version
-	for i := 0; i < 4; i++ {
-		c1[4+i] = FLASH_PLAYER_VERSION[i]
+	binary.BigEndian.PutUint32(c1, uint32(GetTimestamp()))
+	binary.BigEndian.PutUint32(c1[4:], uint32(0))
+	var clientDigestOffset uint32
+	if encrypt {
+		clientDigestOffset := ImprintWithDigest(c1, GENUINE_FP_KEY[:30])
+		if clientDigestOffset == 0 {
+			return errors.New("ImprintWithDigest failed")
+		}
 	}
-
-	// TODO: Create the DH public/private key, and use it in encryption mode
-
-	clientDigestOffset := ImprintWithDigest(c1, GENUINE_FP_KEY[:30])
-	if clientDigestOffset == 0 {
-		return errors.New("ImprintWithDigest failed")
-	}
-
 	_, err = bw.Write(c1)
 	CheckError(err, "Handshake() Send C1")
 	if timeout > 0 {
@@ -218,13 +214,12 @@ func Handshake(c net.Conn, br *bufio.Reader, bw *bufio.Writer, timeout time.Dura
 	}
 	_, err = io.ReadAtLeast(br, s1, RTMP_SIG_SIZE)
 	CheckError(err, "Handshake Read S1")
+	// Remember the time when we received the packet (for C2)
+	timeReceived := GetTimestamp()
 	logger.ModulePrintf(logHandler, log.LOG_LEVEL_DEBUG,
 		"Handshake() FMS version is %d.%d.%d.%d", s1[4], s1[5], s1[6], s1[7])
-	//	if s1[4] < 3 {
-	//		return errors.New(fmt.Sprintf("FMS version is %d.%d.%d.%d, unsupported!", s1[4], s1[5], s1[6], s1[7]))
-	//	}
 
-	// Read S2
+	// Read S2 (before C2, the encryption need server_pos
 	if timeout > 0 {
 		c.SetReadDeadline(time.Now().Add(timeout))
 	}
@@ -233,35 +228,50 @@ func Handshake(c net.Conn, br *bufio.Reader, bw *bufio.Writer, timeout time.Dura
 	CheckError(err, "Handshake() Read S2")
 
 	// Check server response
-	server_pos := ValidateDigest(s1, 8, GENUINE_FMS_KEY[:36])
-	if server_pos == 0 {
-		server_pos = ValidateDigest(s1, 772, GENUINE_FMS_KEY[:36])
+	var server_pos uint32
+	if encrypt {
+		server_pos := ValidateDigest(s1, 8, GENUINE_FMS_KEY[:36])
 		if server_pos == 0 {
-			return errors.New("Server response validating failed")
+			server_pos = ValidateDigest(s1, 772, GENUINE_FMS_KEY[:36])
+			if server_pos == 0 {
+				return errors.New("Server response validating failed")
+			}
+		}
+
+		digest, err := HMACsha256(c1[clientDigestOffset:clientDigestOffset+SHA256_DIGEST_LENGTH], GENUINE_FMS_KEY)
+		CheckError(err, "Get digest from c1 error")
+
+		signature, err := HMACsha256(s2[:RTMP_SIG_SIZE-SHA256_DIGEST_LENGTH], digest)
+		CheckError(err, "Get signature from s2 error")
+
+		if bytes.Compare(signature, s2[RTMP_SIG_SIZE-SHA256_DIGEST_LENGTH:]) != 0 {
+			return errors.New("Server signature mismatch")
+		}
+	} else {
+		if bytes.Compare(c1[:4], s2[:4]) != 0 {
+			return errors.New("Failed to match timestamp between C1 and S2")
 		}
 	}
 
-	digest, err := HMACsha256(c1[clientDigestOffset:clientDigestOffset+SHA256_DIGEST_LENGTH], GENUINE_FMS_KEY)
-	CheckError(err, "Get digest from c1 error")
-
-	signature, err := HMACsha256(s2[:RTMP_SIG_SIZE-SHA256_DIGEST_LENGTH], digest)
-	CheckError(err, "Get signature from s2 error")
-
-	if bytes.Compare(signature, s2[RTMP_SIG_SIZE-SHA256_DIGEST_LENGTH:]) != 0 {
-		return errors.New("Server signature mismatch")
+	// Generate C2
+	var digestResp []byte
+	if encrypt {
+		digestResp, err = HMACsha256(s1[server_pos:server_pos+SHA256_DIGEST_LENGTH], GENUINE_FP_KEY)
+		CheckError(err, "Generate C2 HMACsha256 digestResp")
 	}
 
-	// Generate C2
-	// server_pos := GetDigestOffset1(s1)
-	digestResp, err := HMACsha256(s1[server_pos:server_pos+SHA256_DIGEST_LENGTH], GENUINE_FP_KEY)
-	CheckError(err, "Generate C2 HMACsha256 digestResp")
+	c2 := make([]byte, RTMP_SIG_SIZE)
+	copy(c2, s1)
 
-	c2 := CreateRandomBlock(RTMP_SIG_SIZE)
-	signatureResp, err := HMACsha256(c2[:RTMP_SIG_SIZE-SHA256_DIGEST_LENGTH], digestResp)
-	CheckError(err, "Generate C2 HMACsha256 signatureResp")
-	DumpBuffer("signatureResp", signatureResp, 0)
-	for index, b := range signatureResp {
-		c2[RTMP_SIG_SIZE-SHA256_DIGEST_LENGTH+index] = b
+	if encrypt {
+		signatureResp, err := HMACsha256(c2[:RTMP_SIG_SIZE-SHA256_DIGEST_LENGTH], digestResp)
+		CheckError(err, "Generate C2 HMACsha256 signatureResp")
+		DumpBuffer("signatureResp", signatureResp, 0)
+		for index, b := range signatureResp {
+			c2[RTMP_SIG_SIZE-SHA256_DIGEST_LENGTH+index] = b
+		}
+	} else {
+		binary.BigEndian.PutUint32(c2[4:], timeReceived)
 	}
 
 	// Send C2
@@ -272,7 +282,6 @@ func Handshake(c net.Conn, br *bufio.Reader, bw *bufio.Writer, timeout time.Dura
 	}
 	err = bw.Flush()
 	CheckError(err, "Handshake() Flush C2")
-
 	if timeout > 0 {
 		c.SetDeadline(time.Time{})
 	}
